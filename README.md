@@ -215,6 +215,24 @@ Installers and executables are code-signed.
 |---|---|---|
 | Static site | `cadcraft-web-<ver>.zip` | Runs in a modern browser; host it on any static server |
 
+### Docker
+
+One image carries the browser build (served by nginx) and the headless `cadcraft-cli`, including the
+MCP server over stdio. Nothing is published to a registry; build it from the repository, with the
+web build made first:
+
+```sh
+packaging/web/package.sh                                 # writes dist/web/
+docker build -f packaging/docker/Dockerfile -t cadcraft .
+docker run --rm -p 8771:80 cadcraft                      # the web app → http://localhost:8771/
+docker run --rm -v "$PWD:/work" cadcraft info /work/plan.dxf
+docker run -i --rm cadcraft mcp                          # MCP server on stdio
+```
+
+The desktop app is deliberately not in the image: a container has no window, GPU, tray or native
+dialogs to give it. Building the image (including from a release web zip), the compose setup, and
+the full CLI and MCP examples are in [`packaging/docker/README.md`](packaging/docker/README.md).
+
 ## The Crafting Apps
 
 CADCraft is one of the **Crafting Apps**: free, open-source creative tools from the
