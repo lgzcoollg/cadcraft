@@ -27,8 +27,8 @@ relative URLs, so the published site is byte-for-byte what the image should serv
 
 ```sh
 mkdir -p dist/web
-unzip -j cadcraft-web-0.4.0.zip 'cadcraft-web-0.4.0/index.html' \
-  'cadcraft-web-0.4.0/*.js' 'cadcraft-web-0.4.0/*.wasm' -d dist/web
+unzip -j cadcraft-web-0.5.0.zip 'cadcraft-web-0.5.0/index.html' \
+  'cadcraft-web-0.5.0/*.js' 'cadcraft-web-0.5.0/*.wasm' -d dist/web
 docker build -f packaging/docker/Dockerfile -t cadcraft .
 ```
 
