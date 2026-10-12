@@ -43,6 +43,9 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   TRUNK_VERSION: 0.21.14
+  # The craft-fonts revision the web build embeds. Droid Sans Fallback (Simplified Chinese) is not
+  # in this revision yet, so the check below warns until it lands upstream and this is bumped.
+  CRAFT_FONTS_REV: 8dcdacd5153e64560d109541a47d806f26f048c0
 
 jobs:
   image:
@@ -63,8 +66,28 @@ jobs:
           curl -fsSL "https://github.com/trunk-rs/trunk/releases/download/v${TRUNK_VERSION}/trunk-x86_64-unknown-linux-gnu.tar.gz" \
             | tar -xz -C "$HOME/.cargo/bin" trunk
           trunk --version
+      # A browser has no system fonts, so the site only draws CJK text when the faces are baked
+      # into the wasm. That is a build input (CRAFT_FONTS_DIR), not a Dockerfile step.
+      - name: Check out craft-fonts
+        uses: actions/checkout@v4
+        with:
+          repository: storytold/craft-fonts
+          ref: ${{ env.CRAFT_FONTS_REV }}
+          path: craft-fonts
       - name: Build the web app
+        env:
+          CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
+          CRAFT_FONTS_REQUIRED: "1"
         run: packaging/web/package.sh
+      - name: Check the site carries the CJK face
+        run: |
+          wasm=$(ls dist/web/*.wasm)
+          ls -l "$wasm"
+          if grep -aq "Droid Sans Fallback" "$wasm"; then
+            echo "the CJK face is in the wasm"
+          else
+            echo "::warning::the wasm has no Droid Sans Fallback — bump CRAFT_FONTS_REV once the font lands in storytold/craft-fonts"
+          fi
       - name: Check the site is there
         run: |
           ls -l dist/web

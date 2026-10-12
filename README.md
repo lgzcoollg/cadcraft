@@ -141,8 +141,10 @@ The web build: `cd apps/cadcraft-web && trunk serve` (needs [trunk](https://trun
 CADCraft has no fonts in its repository; it uses the TrueType/OpenType fonts installed on your
 system. Builds made with the optional [craft-fonts](https://github.com/storytold/craft-fonts)
 input (`CRAFT_FONTS_DIR=<absolute path to a checkout> cargo build --release`) also embed its
-fonts: BIZ UDPGothic, BIZ UDMincho and Shippori Mincho (Japanese) and Noto Sans Arabic (the web
-build, which has no system fonts, only BIZ UDPGothic Regular and Noto Sans Arabic). A text style
+fonts: BIZ UDPGothic, BIZ UDMincho and Shippori Mincho (Japanese), Noto Sans Arabic, and Droid
+Sans Fallback (Simplified Chinese). The web build has no system fonts, so it embeds the faces it
+needs there: BIZ UDPGothic Regular, Noto Sans Arabic and Droid Sans Fallback — without them
+Chinese, Japanese and Arabic text would draw as empty boxes. A text style
 can use them by family name, and they draw characters a text's font lacks when no installed
 wide-coverage CJK font has them. Without `CRAFT_FONTS_DIR` nothing is embedded. SHX
 fonts (including big fonts such as `chineset.shx`) aren't read yet: text in an SHX style is drawn

@@ -16,6 +16,8 @@ temp
 dist/release
 dist/web/.stage
 # Not needed by the image; apps/cadcraft (the desktop app) is not built here.
+# The CI workflow checks craft-fonts out here for the web build, which runs before this build.
+craft-fonts
 docs
 examples
 assets

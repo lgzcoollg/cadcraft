@@ -330,7 +330,25 @@ pub fn install_fonts(ctx: &egui::Context) {
         ctx.set_fonts(fonts);
     }
     #[cfg(target_arch = "wasm32")]
-    let _ = ctx;
+    {
+        // A browser has no system fonts, and egui's defaults carry no CJK glyphs, so Chinese,
+        // Japanese or Arabic panel text would draw as empty boxes. A build made with the optional
+        // craft-fonts input (`CRAFT_FONTS_DIR`) has the faces (`crates/fonts/build.rs` embeds
+        // them); install them as fallbacks behind egui's own, so Latin text keeps its look.
+        if !cadcraft_fonts::CRAFT_FONTS.is_empty() {
+            let mut fonts = egui::FontDefinitions::default();
+            for (i, f) in cadcraft_fonts::CRAFT_FONTS.iter().enumerate() {
+                let name: String = format!("craft-fonts-{i}");
+                fonts.font_data.insert(name.clone(), std::sync::Arc::new(egui::FontData::from_static(f.bytes)));
+                for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+                    if let Some(list) = fonts.families.get_mut(&family) {
+                        list.push(name.clone());
+                    }
+                }
+            }
+            ctx.set_fonts(fonts);
+        }
+    }
 }
 
 /// egui's visuals for `theme`, from its tokens.

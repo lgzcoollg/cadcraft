@@ -18,8 +18,17 @@ docker build -f packaging/docker/Dockerfile -t cadcraft .
 ```
 
 `package.sh` needs [trunk](https://trunkrs.dev) and the `wasm32-unknown-unknown` target
-(`rustup target add wasm32-unknown-unknown`); it also bakes in the optional font face when
-`CRAFT_FONTS_DIR` is set, so the image serves the same site the release publishes.
+(`rustup target add wasm32-unknown-unknown`).
+
+**Set `CRAFT_FONTS_DIR` if the site has to draw Chinese, Japanese or Arabic text** — a browser has
+no system fonts, so without the embedded faces those characters show as empty boxes:
+
+```sh
+CRAFT_FONTS_DIR=/path/to/craft-fonts packaging/web/package.sh   # absolute path
+```
+
+That bakes the craft-fonts faces in (Droid Sans Fallback for Simplified Chinese, BIZ UDPGothic for
+Japanese, Noto Sans Arabic), exactly as the release build does, and adds about 9 MB to the wasm.
 
 No trunk at hand? Unpack a [release
 zip](https://github.com/storytold/cadcraft/releases) instead — `index.html` loads everything through
