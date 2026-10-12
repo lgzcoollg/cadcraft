@@ -43,9 +43,11 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   TRUNK_VERSION: 0.21.14
-  # The craft-fonts revision the web build embeds. Droid Sans Fallback (Simplified Chinese) is not
-  # in this revision yet, so the check below warns until it lands upstream and this is bumped.
-  CRAFT_FONTS_REV: 8dcdacd5153e64560d109541a47d806f26f048c0
+  # craft-fonts is a build input, not a dependency (AGENTS.md): the web build embeds its fonts so
+  # a browser can draw CJK text. This is the CADCraft fork, which adds Droid Sans Fallback for
+  # Simplified Chinese; point it back at storytold/craft-fonts once that font lands upstream.
+  CRAFT_FONTS_REPO: lgzcoollg/craft-fonts
+  CRAFT_FONTS_REV: cbe4791a8b28449221132bfdec0f12161b24e4fa
 
 jobs:
   image:
@@ -71,7 +73,7 @@ jobs:
       - name: Check out craft-fonts
         uses: actions/checkout@v4
         with:
-          repository: storytold/craft-fonts
+          repository: ${{ env.CRAFT_FONTS_REPO }}
           ref: ${{ env.CRAFT_FONTS_REV }}
           path: craft-fonts
       - name: Build the web app
@@ -83,11 +85,11 @@ jobs:
         run: |
           wasm=$(ls dist/web/*.wasm)
           ls -l "$wasm"
-          if grep -aq "Droid Sans Fallback" "$wasm"; then
-            echo "the CJK face is in the wasm"
-          else
-            echo "::warning::the wasm has no Droid Sans Fallback — bump CRAFT_FONTS_REV once the font lands in storytold/craft-fonts"
-          fi
+          grep -aq "Droid Sans Fallback" "$wasm" || {
+            echo "::error::the wasm has no Droid Sans Fallback, so Chinese text would draw as boxes; check CRAFT_FONTS_REPO/CRAFT_FONTS_REV"
+            exit 1
+          }
+          echo "the CJK face is in the wasm"
       - name: Check the site is there
         run: |
           ls -l dist/web
