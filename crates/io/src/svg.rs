@@ -2,16 +2,29 @@
 
 use std::fmt::Write as _;
 
-use cadcraft_color::{Rgb, display_rgb};
+use cadcraft_color::Rgb;
 use cadcraft_doc::{Drawing, Space};
+use cadcraft_geom::Bounds2;
 use cadcraft_render::Kind;
 
-/// Export with a white background (colour 7 prints black).
+/// Export with a white background (colour 7 prints black), fitted to the extents.
 pub fn export(d: &Drawing, space: &Space) -> String {
+    export_window(d, space, None)
+}
+
+/// Export showing exactly `window` (the `viewBox`; geometry outside it is clipped by the viewer),
+/// or the extents with a 2% margin when `window` is `None`.
+pub fn export_window(d: &Drawing, space: &Space, window: Option<Bounds2>) -> String {
     let list = cadcraft_render::build(d, space, &cadcraft_render::Options::default());
-    let b = list.bounds;
+    export_list(&list, window)
+}
+
+/// Write a display list (as [`export_window`] does for a space's own).
+pub fn export_list(list: &cadcraft_render::DisplayList, window: Option<Bounds2>) -> String {
+    let window = window.filter(|w| !w.is_empty());
+    let b = window.unwrap_or(list.bounds);
     let (w, h) = if b.is_empty() { (1.0, 1.0) } else { (b.width().max(1e-9), b.height().max(1e-9)) };
-    let m = (w.max(h)) * 0.02;
+    let m = if window.is_some() { 0.0 } else { (w.max(h)) * 0.02 };
     let (x0, y1) = if b.is_empty() { (0.0, 1.0) } else { (b.min.x - m, b.max.y + m) };
     let vw = w + 2.0 * m;
     let vh = h + 2.0 * m;
@@ -27,7 +40,7 @@ pub fn export(d: &Drawing, space: &Space) -> String {
     let tx = |x: f64| x - x0;
     let ty = |y: f64| y1 - y;
     for p in &list.prims {
-        let c = display_rgb(p.color, white).hex();
+        let c = p.display_rgb(white).hex();
         let pts = list.points(p);
         match p.kind {
             Kind::Polyline => {
@@ -40,7 +53,9 @@ pub fn export(d: &Drawing, space: &Space) -> String {
                 }
                 s.push_str(r#""/>"#);
             }
-            Kind::Tris => {
+            Kind::Tris | Kind::Mask => {
+                // A wipeout's mask hides what lies under it with the white background.
+                let c = if p.kind == Kind::Mask { white.hex() } else { c };
                 let _ = write!(s, r#"<path fill="{c}" d=""#);
                 for t in pts.chunks(3) {
                     if let [a, b2, cc] = t {
@@ -56,7 +71,8 @@ pub fn export(d: &Drawing, space: &Space) -> String {
             }
             Kind::Infinite { ray } => {
                 if let (Some(bp), Some(dir)) = (pts.first(), pts.get(1)) {
-                    let far = (vw + vh) * 2.0;
+                    // A window can lie far from the base point: reach past it.
+                    let far = (vw + vh) * 2.0 + if window.is_some() { bp.dist(b.center()) } else { 0.0 };
                     let a = if ray { *bp } else { *bp - *dir * far };
                     let e = *bp + *dir * far;
                     let _ = write!(

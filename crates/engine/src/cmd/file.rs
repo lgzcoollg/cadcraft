@@ -1,13 +1,21 @@
 //! File menu: new, close, switching drawings. Open/save of DWG/DXF go through the io layer,
-//! registered by the host (desktop/CLI) via [`crate::cmd::file::set_io`].
+//! registered by the host (desktop/CLI) via [`crate::cmd::file::set_io`]. On the web, where there is
+//! no file system, saved files reach the user through the host's [`crate::cmd::file::set_deliver`].
+
+mod pgp;
+mod template;
 
 use std::sync::OnceLock;
 
 use cadcraft_doc::Drawing;
+pub use cadcraft_dxf::Version;
 use serde_json::{Value, json};
 
 use super::*;
 use crate::{Result, Session};
+
+pub(crate) use pgp::{specs as alias_specs, user_alias};
+pub use template::{qnew_template, set_qnew_template};
 
 /// Plot a space to PDF bytes with JSON options (`{paper?, landscape?, fit?, lineweights?, …}`).
 pub type PlotHook = fn(&Drawing, &cadcraft_doc::Space, &Value) -> std::result::Result<Vec<u8>, String>;
@@ -29,13 +37,102 @@ pub fn io() -> Option<&'static IoHooks> {
     IO.get()
 }
 
+/// COMPARE (drawing comparison).
+pub mod compare;
+
+/// Hand finished file bytes to the user where there is no file system (the browser: a download).
+/// Arguments: file name, MIME type, bytes. `Ok` only once the delivery was actually started.
+pub type DeliverHook = fn(&str, &str, &[u8]) -> std::result::Result<(), String>;
+
+static DELIVER: OnceLock<DeliverHook> = OnceLock::new();
+
+/// Install the host's file delivery (the web app: a browser download). Saving uses it on wasm;
+/// anything else that produces a file on the web (plots) can use [`deliver`] too.
+pub fn set_deliver(h: DeliverHook) {
+    let _ = DELIVER.set(h);
+}
+pub fn deliver() -> Option<DeliverHook> {
+    DELIVER.get().copied()
+}
+
+/// How a drawing file is written: its version (`None`: the drawing's own, `$ACADVER`) and
+/// binary instead of ASCII DXF.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SaveAs {
+    pub version: Option<Version>,
+    pub binary: bool,
+}
+
+/// Write a drawing with [`SaveAs`] options (installed by hosts whose writer supports them).
+pub type WriteAsHook = fn(&Drawing, &str, &SaveAs) -> std::result::Result<Vec<u8>, String>;
+
+static WRITE_AS: OnceLock<WriteAsHook> = OnceLock::new();
+
+/// Install the host's writer for [`SaveAs`] options; saves that ask for none use [`IoHooks::write`].
+pub fn set_write_as(h: WriteAsHook) {
+    let _ = WRITE_AS.set(h);
+}
+pub fn write_as() -> Option<WriteAsHook> {
+    WRITE_AS.get().copied()
+}
+
+/// The versions a drawing can be saved in, for messages ("2000, 2004, …, 2018").
+fn version_list() -> String {
+    Version::ALL.iter().map(|v| v.year()).collect::<Vec<_>>().join(", ")
+}
+
+/// The `version` and `binary` parameters of a save: a version is a year (2018 or "2018"), "R2018"
+/// or an `$ACADVER` code ("AC1032").
+fn save_options(cmd: &str, p: &Value) -> Result<SaveAs> {
+    let version = match p.get("version") {
+        None | Some(Value::Null) => None,
+        Some(v) => {
+            let text = match v {
+                Value::String(s) => s.clone(),
+                Value::Number(n) => n.to_string(),
+                _ => String::new(),
+            };
+            let name: String = text.chars().take(40).collect();
+            Some(Version::parse(&text).ok_or_else(|| bad(cmd, format!("unknown version `{name}` (use {})", version_list())))?)
+        }
+    };
+    let binary = match p.get("binary") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err(bad(cmd, "`binary` must be true or false")),
+    };
+    Ok(SaveAs { version, binary })
+}
+
+/// Whether `path` names a DXF file (or has no extension, which saves as DXF).
+fn is_dxf(path: &str) -> bool {
+    let ext = std::path::Path::new(path).extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    matches!(ext.as_str(), "dxf" | "")
+}
+
+/// The drawing written to `path` with `opts`: through [`IoHooks::write`] when no option is set,
+/// else through the [`write_as`] hook.
+fn write_bytes(s: &Session, cmd: &str, path: &str, opts: &SaveAs) -> Result<Vec<u8>> {
+    let hooks = io().ok_or_else(|| bad(cmd, "file formats are not available in this build"))?;
+    if opts.binary && !is_dxf(path) {
+        return Err(bad(cmd, "binary applies to DXF files only"));
+    }
+    let r = if *opts == SaveAs::default() {
+        (hooks.write)(s.doc()?, path)
+    } else {
+        let w = write_as().ok_or_else(|| bad(cmd, "saving at a chosen version or as binary DXF is not available in this build"))?;
+        w(s.doc()?, path, opts)
+    };
+    r.map_err(|e| bad(cmd, e))
+}
+
 pub fn specs() -> Vec<CommandSpec> {
     vec![
         CommandSpec::new("new", "New Drawing...", run_new)
             .menu(&["File", "New Drawing..."])
             .key("Cmd+N")
             .alias(&["qnew"])
-            .params("{metric?: bool}")
+            .params("{metric?: bool, template?: path to a .dwt/.dxf template (\".\" for none; default QNEWTEMPLATE)}")
             .enabled(always)
             .noundo(),
         CommandSpec::new("open", "Open...", run_open)
@@ -46,18 +143,23 @@ pub fn specs() -> Vec<CommandSpec> {
             .noundo(),
         CommandSpec::new("close", "Close", run_close).menu(&["File", "Close"]).key("Cmd+W").params("{index?}").noundo(),
         CommandSpec::new("closeall", "Close All", run_closeall).menu(&["File", "Close All"]).enabled(always).noundo(),
-        CommandSpec::new("qsave", "Save", run_save).menu(&["File", "Save"]).key("Cmd+S").alias(&["save"]).params("{path?}").noundo(),
-        CommandSpec::new("saveas", "Save As...", run_saveas)
+        CommandSpec::new("qsave", "Save", run_qsave_reporting).menu(&["File", "Save"]).key("Cmd+S").alias(&["save"]).params("{path?}").noundo(),
+        CommandSpec::new("saveas", "Save As...", run_saveas_reporting)
             .menu(&["File", "Save As..."])
             .key("Cmd+Shift+S")
-            .params("{path, format?: dxf|dwg}")
+            .params("{path, version?: 2000|2004|2007|2010|2013|2018, binary?: bool}")
             .noundo(),
         CommandSpec::new("document.switch", "Switch Drawing", run_switch).params("{index}").enabled(always).noundo(),
-        CommandSpec::new("document.bytes", "Drawing as bytes", run_bytes).params("{format?: dxf} → {data: base64}").noundo(),
+        CommandSpec::new("document.bytes", "Drawing as bytes", run_bytes)
+            .params("{format?: dxf, version?: 2000…2018, binary?: bool} → {data: base64}")
+            .noundo(),
     ]
 }
 
 fn run_new(s: &mut Session, p: &Value) -> Result<Value> {
+    if let Some(r) = template::run_new(s, p)? {
+        return Ok(r);
+    }
     let i = s.new_drawing(bool_or(p, "metric", false));
     Ok(json!({ "index": i, "title": s.docs.get(i).map(|d| d.title.clone()) }))
 }
@@ -69,7 +171,15 @@ fn file_name(path: &str) -> String {
 pub(crate) fn open_bytes(s: &mut Session, bytes: &[u8], name: &str, path: Option<String>) -> Result<usize> {
     let hooks = io().ok_or_else(|| bad("open", "file formats are not available in this build"))?;
     let d = (hooks.read)(bytes, name).map_err(|e| bad("open", e))?;
-    Ok(s.open_drawing(d, &file_name(name), path))
+    // A file that isn't a drawing (an imported SVG) gives the drawing no file name: QSAVE then
+    // asks where to save instead of exporting over the original.
+    let path = path.filter(|p| is_drawing_file(p));
+    let i = s.open_drawing(d, &file_name(name), path);
+    if let Some(st) = s.docs.get_mut(i) {
+        // QSAVE keeps a binary DXF binary.
+        st.binary_dxf = cadcraft_dxf::is_binary(bytes);
+    }
+    Ok(i)
 }
 
 fn run_open(s: &mut Session, p: &Value) -> Result<Value> {
@@ -80,6 +190,7 @@ fn run_open(s: &mut Session, p: &Value) -> Result<Value> {
         {
             let bytes = std::fs::read(path).map_err(|e| bad("open", format!("{path}: {e}")))?;
             let i = open_bytes(s, &bytes, path, Some(path.to_string()))?;
+            super::blocks::xref::after_open(s, i);
             return Ok(json!({ "index": i, "entities": s.docs.get(i).map(|d| d.doc.entity_count()) }));
         }
         #[cfg(target_arch = "wasm32")]
@@ -89,6 +200,7 @@ fn run_open(s: &mut Session, p: &Value) -> Result<Value> {
     let bytes = base64_decode(data).ok_or_else(|| bad("open", "invalid base64"))?;
     let name = str_param(p, "name").unwrap_or("Drawing.dxf");
     let i = open_bytes(s, &bytes, name, None)?;
+    super::blocks::xref::after_open(s, i);
     Ok(json!({ "index": i }))
 }
 
@@ -99,6 +211,10 @@ fn run_close(s: &mut Session, p: &Value) -> Result<Value> {
     }
     s.cancel();
     s.docs.remove(i);
+    if i < s.active {
+        // An earlier drawing went away: the active one shifted down by one.
+        s.active -= 1;
+    }
     if s.active >= s.docs.len() {
         s.active = s.docs.len().saturating_sub(1);
     }
@@ -113,19 +229,73 @@ fn run_closeall(s: &mut Session, _p: &Value) -> Result<Value> {
 }
 
 pub(crate) fn save_to(s: &mut Session, path: &str) -> Result<usize> {
-    let hooks = io().ok_or_else(|| bad("save", "file formats are not available in this build"))?;
-    let bytes = (hooks.write)(s.doc()?, path).map_err(|e| bad("save", e))?;
+    let opts = SaveAs { version: None, binary: s.state()?.binary_dxf && is_dxf(path) };
+    save_as(s, "save", path, &opts)
+}
+
+/// Save to `path` with `opts`. A drawing file then keeps the version and binary choice: the
+/// version goes into the drawing's `$ACADVER`, so later saves (QSAVE) write it again.
+fn save_as(s: &mut Session, cmd: &str, path: &str, opts: &SaveAs) -> Result<usize> {
+    let bytes = write_bytes(s, cmd, path, opts)?;
+    let n = commit_save(s, path, &bytes, store)?;
+    if is_drawing_file(path) {
+        let st = s.state_mut()?;
+        st.binary_dxf = opts.binary;
+        if let Some(v) = opts.version
+            && st.doc.header.get("ACADVER").and_then(cadcraft_doc::HVal::as_str) != Some(v.code())
+        {
+            std::sync::Arc::make_mut(&mut st.doc).header.set_str("ACADVER", v.code());
+            st.saved = st.doc.clone();
+        }
+    }
+    Ok(n)
+}
+
+/// Put saved bytes where the user gets them: natively the file at `path` (written atomically); on
+/// the web, which has no file system, a browser download named after `path` via [`deliver`].
+fn store(path: &str, bytes: &[u8]) -> Result<()> {
     #[cfg(not(target_arch = "wasm32"))]
     {
         let tmp = format!("{path}.cadcraft-tmp");
-        std::fs::write(&tmp, &bytes).map_err(|e| bad("save", format!("{path}: {e}")))?;
+        std::fs::write(&tmp, bytes).map_err(|e| bad("save", format!("{path}: {e}")))?;
         std::fs::rename(&tmp, path).map_err(|e| bad("save", format!("{path}: {e}")))?;
+        Ok(())
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let name = file_name(path);
+        let deliver = deliver().ok_or_else(|| bad("save", "saving files is not available in this build; use document.bytes"))?;
+        deliver(&name, "application/octet-stream", bytes).map_err(|e| bad("save", format!("{name}: {e}")))
+    }
+}
+
+/// Store the bytes, then mark the drawing saved under `path`. If storing fails the drawing keeps
+/// its unsaved changes, file name and title. On the web a started download counts as saved: the
+/// browser owns the file from there (we can't see whether the user keeps it), and the name stays so
+/// a later QSAVE downloads the drawing again under it. An image or PDF export (SVG, PNG, PDF) only
+/// stores the file: the drawing keeps its name, title and unsaved changes, so closing still asks.
+fn commit_save(s: &mut Session, path: &str, bytes: &[u8], store: impl FnOnce(&str, &[u8]) -> Result<()>) -> Result<usize> {
+    s.state()?;
+    store(path, bytes)?;
+    if !is_drawing_file(path) {
+        return Ok(bytes.len());
     }
     let st = s.state_mut()?;
     st.saved = st.doc.clone();
     st.path = Some(path.to_string());
     st.title = file_name(path);
+    // A BEgin group still open when the drawing is saved ends there.
+    st.end_undo_group();
     Ok(bytes.len())
+}
+
+/// The save result; on the web it also names the file the browser downloaded.
+fn saved(path: &str, bytes: usize) -> Value {
+    let mut r = json!({ "path": path, "bytes": bytes });
+    if cfg!(target_arch = "wasm32") {
+        r["download"] = json!(file_name(path));
+    }
+    r
 }
 
 fn run_save(s: &mut Session, p: &Value) -> Result<Value> {
@@ -134,13 +304,27 @@ fn run_save(s: &mut Session, p: &Value) -> Result<Value> {
         None => s.state()?.path.clone().ok_or_else(|| bad("qsave", "drawing has no file name yet; use saveas {path}"))?,
     };
     let n = save_to(s, &path)?;
-    Ok(json!({ "path": path, "bytes": n }))
+    Ok(saved(&path, n))
 }
 
 fn run_saveas(s: &mut Session, p: &Value) -> Result<Value> {
     let path = str_param(p, "path").ok_or_else(|| bad("saveas", "`path` is required"))?.to_string();
-    let n = save_to(s, &path)?;
-    Ok(json!({ "path": path, "bytes": n }))
+    let opts = save_options("saveas", p)?;
+    let n = save_as(s, "saveas", &path, &opts)?;
+    let mut r = saved(&path, n);
+    if is_drawing_file(&path) {
+        r["version"] = json!(opts.version.unwrap_or_else(|| drawing_version(s, &path)).year());
+        r["binary"] = json!(opts.binary);
+    }
+    Ok(r)
+}
+
+/// The version a drawing is saved in at `path` when none is asked for: its `$ACADVER` (2018 by
+/// default), and for DWG at least 2004 (the io layer's rule: R2000 DWG has no true colours).
+fn drawing_version(s: &Session, path: &str) -> Version {
+    let v =
+        s.doc().ok().and_then(|d| d.header.get("ACADVER").and_then(cadcraft_doc::HVal::as_str).and_then(Version::for_acadver)).unwrap_or_default();
+    if is_dxf(path) { v } else { v.max(Version::R2004) }
 }
 
 fn run_switch(s: &mut Session, p: &Value) -> Result<Value> {
@@ -154,10 +338,79 @@ fn run_switch(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn run_bytes(s: &mut Session, p: &Value) -> Result<Value> {
-    let hooks = io().ok_or_else(|| bad("document.bytes", "file formats are not available in this build"))?;
     let fmt = str_param(p, "format").unwrap_or("dxf");
-    let bytes = (hooks.write)(s.doc()?, &format!("drawing.{fmt}")).map_err(|e| bad("document.bytes", e))?;
-    Ok(json!({ "data": base64_encode(&bytes), "bytes": bytes.len() }))
+    let opts = save_options("document.bytes", p)?;
+    let lost = not_saved(s.doc()?);
+    let bytes = write_bytes(s, "document.bytes", &format!("drawing.{fmt}"), &opts)?;
+    let mut r = json!({ "data": base64_encode(&bytes), "bytes": bytes.len() });
+    if drops_unknown(&format!("drawing.{fmt}")) {
+        report_not_saved(s, &mut r, &lost);
+    }
+    Ok(r)
+}
+
+/// Entities a DXF or DWG file doesn't keep: those of object types CADCraft doesn't model
+/// (3DSOLID, MULTILEADER… read from other programs' files and kept in the drawing, but
+/// not written), counted by DXF type across model space, layouts and block definitions.
+pub fn not_saved(d: &Drawing) -> std::collections::BTreeMap<String, usize> {
+    let mut out: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let stores = std::iter::once(&d.model).chain(d.layouts.iter().map(|l| &l.entities)).chain(d.blocks.values().map(|b| &b.entities));
+    for e in stores.flat_map(|s| s.iter()) {
+        if let cadcraft_doc::EntityKind::Unknown(u) = &e.kind {
+            let n = out.entry(u.dxf_type.clone()).or_insert(0);
+            *n = n.saturating_add(1);
+        }
+    }
+    out
+}
+
+/// The command-line warning for [`not_saved`] entities, or `None` when the file keeps everything.
+pub fn not_saved_message(lost: &std::collections::BTreeMap<String, usize>) -> Option<String> {
+    if lost.is_empty() {
+        return None;
+    }
+    let list: Vec<String> = lost.iter().map(|(t, n)| format!("{n} {t}")).collect();
+    Some(format!("Not saved in the DWG file (its writer can't write these object types yet; DXF keeps them): {}", list.join(", ")))
+}
+
+/// Whether saving to `path` leaves out the entities [`not_saved`] counts: DWG does (the DWG
+/// bridge drops types it doesn't know); DXF writes them back as read.
+pub fn drops_unknown(path: &str) -> bool {
+    // Templates (.dwt) are written as DWG too.
+    std::path::Path::new(path).extension().is_some_and(|e| e.eq_ignore_ascii_case("dwg") || e.eq_ignore_ascii_case("dwt"))
+}
+
+/// Whether `path` is saved as a drawing (DXF, DWG) rather than exported as an image.
+fn is_drawing_file(path: &str) -> bool {
+    let ext = std::path::Path::new(path).extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    matches!(ext.as_str(), "dxf" | "dwg" | "dwt" | "")
+}
+
+/// Say on the command line what the file couldn't keep, and list it in the result's `notSaved`.
+fn report_not_saved(s: &mut Session, r: &mut Value, lost: &std::collections::BTreeMap<String, usize>) {
+    let Some(msg) = not_saved_message(lost) else { return };
+    s.echo(msg);
+    if let Some(o) = r.as_object_mut() {
+        o.insert("notSaved".into(), json!(lost));
+    }
+}
+
+/// Save, then report the entities the file couldn't keep (nothing is dropped silently).
+fn save_reporting(s: &mut Session, p: &Value, run: fn(&mut Session, &Value) -> Result<Value>) -> Result<Value> {
+    let lost = s.doc().map(not_saved).unwrap_or_default();
+    let mut r = run(s, p)?;
+    if r.get("path").and_then(Value::as_str).is_some_and(drops_unknown) {
+        report_not_saved(s, &mut r, &lost);
+    }
+    Ok(r)
+}
+
+fn run_qsave_reporting(s: &mut Session, p: &Value) -> Result<Value> {
+    save_reporting(s, p, run_save)
+}
+
+fn run_saveas_reporting(s: &mut Session, p: &Value) -> Result<Value> {
+    save_reporting(s, p, run_saveas)
 }
 
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -200,4 +453,71 @@ pub fn base64_decode(s: &str) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use crate::Session;
+
+    fn active_title(s: &Session) -> String {
+        s.state().unwrap().title.clone()
+    }
+
+    #[test]
+    fn closing_earlier_inactive_drawing_keeps_active_drawing() {
+        let mut s = Session::new();
+        s.execute("new", &json!({})).unwrap();
+        s.execute("new", &json!({})).unwrap();
+        s.execute("document.switch", &json!({"index": 1})).unwrap();
+        assert_eq!(active_title(&s), "Drawing2");
+        s.execute("close", &json!({"index": 0})).unwrap();
+        assert_eq!(active_title(&s), "Drawing2");
+        assert_eq!(s.docs.len(), 2);
+    }
+
+    #[test]
+    fn closing_later_inactive_drawing_keeps_active_drawing() {
+        let mut s = Session::new();
+        s.execute("new", &json!({})).unwrap();
+        s.execute("new", &json!({})).unwrap();
+        s.execute("document.switch", &json!({"index": 1})).unwrap();
+        s.execute("close", &json!({"index": 2})).unwrap();
+        assert_eq!(active_title(&s), "Drawing2");
+    }
+}
+
+#[cfg(test)]
+mod pr193_tests {
+    use super::*;
+
+    #[test]
+    fn failed_store_keeps_unsaved_changes_and_delivered_save_clears_them() {
+        let mut s = Session::new();
+        s.cmdline("circle 4,4 1").unwrap();
+        let st = s.state().unwrap();
+        let title = st.title.clone();
+        assert!(st.is_dirty() && st.path.is_none());
+
+        // The file route is unavailable or fails (the web without a download): no success, still dirty.
+        let failed = commit_save(&mut s, "a/Owned.dxf", b"0\nEOF\n", |_, _| Err(bad("save", "no download")));
+        assert!(failed.is_err());
+        let st = s.state().unwrap();
+        assert!(st.is_dirty(), "a save that delivered nothing must keep the unsaved state");
+        assert_eq!((st.path.as_deref(), st.title.as_str()), (None, title.as_str()));
+
+        // The file route took the bytes (written, or a download started): saved under that name.
+        let mut got = None;
+        let n = commit_save(&mut s, "a/Owned.dxf", b"0\nEOF\n", |p, b| {
+            got = Some((p.to_string(), b.len()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!((n, got), (6, Some(("a/Owned.dxf".to_string(), 6))));
+        let st = s.state().unwrap();
+        assert!(!st.is_dirty());
+        assert_eq!((st.path.as_deref(), st.title.as_str()), (Some("a/Owned.dxf"), "Owned.dxf"));
+        assert_eq!(saved("a/Owned.dxf", n)["bytes"], 6);
+    }
 }
