@@ -1,0 +1,24 @@
+# Build context for packaging/docker/Dockerfile: the workspace manifests, the crate sources that
+# `cargo build -p cadcraft-cli` links, the contributor tables crates/ui-egui bakes in at build time,
+# the built web site the image serves (dist/web), and packaging/docker/nginx/default.conf.
+# Everything else stays out of the upload.
+.git
+.github
+target
+target-*
+plan
+plans
+log
+temp
+.claude
+# Keep dist/web — the site the image serves — and drop the release artifacts beside it. Trunk's
+# staging directory is only there while a build is running and must never end up in the image.
+dist/release
+dist/web/.stage
+# Not needed by the image; apps/cadcraft (the desktop app) is not built here.
+# The CI workflow checks craft-fonts out here for the web build, which runs before this build.
+craft-fonts
+docs
+examples
+assets
+ROADMAP.md

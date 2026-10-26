@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>图纸查看器 · CADCraft</title>
+<style>
+  :root { color-scheme: dark; --bg:#1b1f24; --panel:#22282f; --line:#333c46; --text:#dfe4ea; --dim:#93a1b0; --accent:#4a9eff; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--text);
+               font:13px/1.5 system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
+  header { display:flex; align-items:center; gap:10px; padding:8px 12px; background:var(--panel); border-bottom:1px solid var(--line); }
+  header h1 { font-size:14px; margin:0 8px 0 0; font-weight:600; white-space:nowrap; }
+  #status { color:var(--dim); flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #status.error { color:#ff8a8a; }
+  button, .btn { background:#2c343d; color:var(--text); border:1px solid var(--line); border-radius:6px;
+                 padding:5px 10px; font:inherit; cursor:pointer; white-space:nowrap; }
+  button:hover, .btn:hover { border-color:var(--accent); }
+  button:disabled { opacity:.45; cursor:default; }
+  input[type=search] { background:#171b20; color:var(--text); border:1px solid var(--line); border-radius:6px;
+                       padding:5px 8px; font:inherit; width:180px; }
+  main { display:flex; height:calc(100% - 45px); }
+  aside { width:280px; min-width:180px; overflow:auto; border-right:1px solid var(--line); background:var(--panel); }
+  aside a { display:block; padding:6px 12px; color:var(--text); text-decoration:none; border-bottom:1px solid #262d35;
+            overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  aside a:hover { background:#2c343d; }
+  aside a.active { background:#2f3b48; border-left:3px solid var(--accent); padding-left:9px; }
+  aside p { color:var(--dim); padding:10px 12px; margin:0; }
+  #viewer { flex:1; border:0; background:#14181d; }
+  code { background:#171b20; padding:1px 4px; border-radius:4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>图纸查看器</h1>
+  <input type="search" id="filter" placeholder="过滤图纸名…" aria-label="过滤图纸名">
+  <label class="btn">打开本地文件<input type="file" id="pick" accept=".dxf,.dwg" hidden></label>
+  <button id="download" disabled>下载当前图纸</button>
+  <span id="status">正在启动 CADCraft…</span>
+</header>
+<main>
+  <aside id="list"><p>正在读取图纸清单…</p></aside>
+  <!-- ?host=parent: CADCraft 以嵌入模式启动，接收本页发来的图纸，并把"保存/导出"的内容回传本页 -->
+  <iframe id="viewer" src="./viewer/?host=parent" allow="fullscreen; clipboard-read; clipboard-write"></iframe>
+</main>
+<script>
+(() => {
+  "use strict";
+  const ORIGIN = location.origin;
+  const frame = document.getElementById('viewer');
+  const statusEl = document.getElementById('status');
+  const listEl = document.getElementById('list');
+  const filterEl = document.getElementById('filter');
+  const downloadBtn = document.getElementById('download');
+
+  let ready = false;      // CADCraft 报过 cadcraft:ready
+  let pending = null;     // 等待发送的图纸 {name, bytes}
+  let lastSave = null;    // 最近一次保存/导出 {name, bytes}
+  let current = null;     // 当前图纸的路径（清单里的那个）
+
+  const status = (text, isError) => {
+    statusEl.textContent = text;
+    statusEl.classList.toggle('error', !!isError);
+  };
+
+  // ---- 与 CADCraft 的桥（消息格式见 apps/cadcraft-web/src/host.rs）----
+  function openInViewer(name, bytes) {
+    if (!(bytes instanceof ArrayBuffer)) bytes = bytes.buffer;
+    if (!ready) { pending = { name, bytes }; status('图纸已就绪，等 CADCraft 启动…'); return; }
+    // transfer 让 ArrayBuffer 零拷贝交给 iframe
+    frame.contentWindow.postMessage({ type: 'cadcraft:open', name, bytes }, ORIGIN, [bytes]);
+    status('已打开 ' + name);
+  }
+
+  addEventListener('message', (e) => {
+    if (e.origin !== ORIGIN || e.source !== frame.contentWindow) return;   // 只认自己嵌入的那个 iframe
+    const d = e.data;
+    if (!d || typeof d !== 'object') return;
+    switch (d.type) {
+      case 'cadcraft:ready':
+        ready = true;
+        if (pending) { const p = pending; pending = null; openInViewer(p.name, p.bytes); }
+        else status('就绪 · 从左侧选一张图纸，或直接拖文件进来');
+        break;
+      case 'cadcraft:save':        // Save / Save As / 导出都会回传到这里
+        lastSave = { name: d.name, bytes: d.bytes };
+        downloadBtn.disabled = false;
+        saveAs(d.bytes, d.name);
+        status('已下载 ' + d.name);
+        break;
+      case 'cadcraft:dirty':
+        status(d.dirty ? '有未保存的改动（Ctrl+S 会下载到本机）' : '就绪');
+        break;
+      case 'cadcraft:failed':
+        status('CADCraft 启动失败：' + (d.error || '未知错误'), true);
+        break;
+    }
+  });
+
+  window.addEventListener('beforeunload', (e) => {
+    // 有未保存改动时，浏览器自己也会问一次；这里只是补充。
+    if (lastSave === null && pending === null) return;
+  });
+
+  function saveAs(bytes, name) {
+    const url = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
+    const a = document.createElement('a');
+    a.href = url; a.download = name || 'drawing.dxf';
+    document.body.append(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+  }
+
+  downloadBtn.onclick = () => { if (lastSave) saveAs(lastSave.bytes, lastSave.name); };
+
+  // ---- 图纸清单（CI 生成的 drawings/index.txt，一行一个路径）----
+  async function fetchDrawing(path) {
+    status('正在读取 ' + path + '…');
+    try {
+      const res = await fetch(encodeURI('./drawings/' + path));
+      if (!res.ok) throw new Error(res.status + ' ' + res.statusText);
+      const bytes = await res.arrayBuffer();
+      openInViewer(path.split('/').pop(), bytes);
+      current = path;
+      for (const a of listEl.querySelectorAll('a')) a.classList.toggle('active', a.dataset.path === path);
+    } catch (err) {
+      status('读不到 ' + path + '（' + err.message + '）', true);
+    }
+  }
+
+  function renderList(files) {
+    const drawn = files.filter(Boolean);
+    if (!drawn.length) {
+      listEl.innerHTML = '<p>清单是空的。把 <code>.dxf</code> / <code>.dwg</code> 放进仓库，CI 会把它们列在这里；' +
+                         '也可以用上面的「打开本地文件」，或把文件拖到页面上。</p>';
+      return;
+    }
+    const frag = document.createDocumentFragment();
+    for (const path of drawn) {
+      const a = document.createElement('a');
+      a.href = '#'; a.textContent = path; a.dataset.path = path; a.title = path;
+      a.onclick = (e) => { e.preventDefault(); fetchDrawing(path); };
+      frag.append(a);
+    }
+    listEl.replaceChildren(frag);
+  }
+
+  filterEl.oninput = () => {
+    const q = filterEl.value.trim().toLowerCase();
+    for (const a of listEl.querySelectorAll('a')) a.hidden = q !== '' && !a.dataset.path.toLowerCase().includes(q);
+  };
+
+  (async () => {
+    try {
+      const res = await fetch('./drawings/index.txt', { cache: 'no-cache' });
+      renderList(res.ok ? (await res.text()).split('\n') : []);
+    } catch { renderList([]); }
+  })();
+
+  // ---- 本地文件与拖放 ----
+  document.getElementById('pick').onchange = async (e) => {
+    const f = e.target.files && e.target.files[0];
+    if (f) openInViewer(f.name, await f.arrayBuffer());
+    e.target.value = '';
+  };
+  addEventListener('dragover', (e) => e.preventDefault());
+  addEventListener('drop', async (e) => {
+    e.preventDefault();
+    const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    if (f) openInViewer(f.name, await f.arrayBuffer());
+  });
+})();
+</script>
+</body>
+</html>

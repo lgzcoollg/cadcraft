@@ -1,0 +1,144 @@
+# Container check: one image, built from packaging/docker/Dockerfile, serves the wasm app with nginx
+# and carries cadcraft-cli (including MCP over stdio). The job builds the web app the way a release
+# does, then builds and runs the image — a broken image fails here instead of on someone's machine.
+# Nothing is pushed to a registry; the release workflow owns the published artifacts
+# (packaging/docker/README.md has the manual build).
+name: Docker
+
+on:
+  push:
+    branches: [main, release]
+    paths:
+      - ".dockerignore"
+      - ".github/workflows/docker.yml"
+      - "apps/**"
+      - "contributors/**"
+      - "crates/**"
+      - "xtask/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "packaging/docker/**"
+      - "packaging/web/**"
+  pull_request:
+    paths:
+      - ".dockerignore"
+      - ".github/workflows/docker.yml"
+      - "apps/**"
+      - "contributors/**"
+      - "crates/**"
+      - "xtask/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "packaging/docker/**"
+      - "packaging/web/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  TRUNK_VERSION: 0.21.14
+  # craft-fonts is a build input, not a dependency (AGENTS.md): the web build embeds its fonts so
+  # a browser can draw CJK text. This is the CADCraft fork, which adds Droid Sans Fallback for
+  # Simplified Chinese; point it back at storytold/craft-fonts once that font lands upstream.
+  CRAFT_FONTS_REPO: lgzcoollg/craft-fonts
+  CRAFT_FONTS_REV: cbe4791a8b28449221132bfdec0f12161b24e4fa
+
+jobs:
+  image:
+    name: CADCraft image (CLI + MCP + web)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The image copies dist/web rather than building wasm itself (packaging/docker/README.md), so
+      # the site is made here first, the same way release.yml makes it.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: docker-image
+      - name: Install trunk
+        run: |
+          curl -fsSL "https://github.com/trunk-rs/trunk/releases/download/v${TRUNK_VERSION}/trunk-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar -xz -C "$HOME/.cargo/bin" trunk
+          trunk --version
+      # A browser has no system fonts, so the site only draws CJK text when the faces are baked
+      # into the wasm. That is a build input (CRAFT_FONTS_DIR), not a Dockerfile step.
+      - name: Check out craft-fonts
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.CRAFT_FONTS_REPO }}
+          ref: ${{ env.CRAFT_FONTS_REV }}
+          path: craft-fonts
+      - name: Build the web app
+        env:
+          CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
+          CRAFT_FONTS_REQUIRED: "1"
+        run: packaging/web/package.sh
+      - name: Check the site carries the CJK face
+        run: |
+          wasm=$(ls dist/web/*.wasm)
+          ls -l "$wasm"
+          grep -aq "Droid Sans Fallback" "$wasm" || {
+            echo "::error::the wasm has no Droid Sans Fallback, so Chinese text would draw as boxes; check CRAFT_FONTS_REPO/CRAFT_FONTS_REV"
+            exit 1
+          }
+          echo "the CJK face is in the wasm"
+      - name: Check the site is there
+        run: |
+          ls -l dist/web
+          test -f dist/web/index.html || { echo "::error::dist/web/index.html is missing"; exit 1; }
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: packaging/docker/Dockerfile
+          tags: cadcraft
+          load: true
+          # The Actions cache carries the layers between runs. The slow part is the CLI build from
+          # Cargo.lock; it is skipped as long as its inputs are unchanged.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Check the compose file
+        run: docker compose -f packaging/docker/compose.yaml config --quiet
+      - name: CLI — a sample drawing written, converted and inspected through a mounted directory
+        run: |
+          docker run --rm cadcraft --version
+          mkdir -p work
+          docker run --rm -v "$PWD/work:/work" cadcraft sample bracket /work/bracket.dxf
+          test -s work/bracket.dxf || { echo "::error::sample wrote no drawing"; exit 1; }
+          docker run --rm -v "$PWD/work:/work" cadcraft info /work/bracket.dxf
+          docker run --rm -v "$PWD/work:/work" cadcraft convert /work/bracket.dxf /work/bracket.svg
+          test -s work/bracket.svg || { echo "::error::convert wrote no SVG"; exit 1; }
+          docker run --rm -v "$PWD/work:/work" cadcraft run --sample --export /work/render.png
+          test -s work/render.png || { echo "::error::run rendered no PNG"; exit 1; }
+      - name: MCP — a JSON-RPC handshake and the tool list over stdio
+        run: |
+          out="$(printf '%s\n' \
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}' \
+            '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
+            | docker run --rm -i cadcraft mcp)"
+          printf '%s\n' "$out"
+          case "$out" in
+            *'"name":"command_line"'*) ;;
+            *) echo "::error::tools/list did not list command_line"; exit 1 ;;
+          esac
+      - name: Serve the web app and check the site
+        # compose reuses the image built above; the port is the one smoke-test.sh defaults to.
+        working-directory: packaging/docker
+        run: |
+          docker compose up --detach --wait
+          ./smoke-test.sh
+      - name: Container logs and cleanup
+        if: always()
+        working-directory: packaging/docker
+        run: |
+          docker compose logs --no-color || true
+          docker compose down --volumes || true

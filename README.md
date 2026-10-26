@@ -147,8 +147,10 @@ The web build: `cd apps/cadcraft-web && trunk serve` (needs [trunk](https://gith
 CADCraft has no fonts in its repository; it uses the TrueType/OpenType fonts installed on your
 system. Builds made with the optional [craft-fonts](https://github.com/storytold/craft-fonts)
 input (`CRAFT_FONTS_DIR=<absolute path to a checkout> cargo build --release`) also embed its
-fonts: BIZ UDPGothic, BIZ UDMincho and Shippori Mincho (Japanese) and Noto Sans Arabic (the web
-build, which has no system fonts, only BIZ UDPGothic Regular and Noto Sans Arabic). A text style
+fonts: BIZ UDPGothic, BIZ UDMincho and Shippori Mincho (Japanese), Noto Sans Arabic, and Droid
+Sans Fallback (Simplified Chinese). The web build has no system fonts, so it embeds the faces it
+needs there: BIZ UDPGothic Regular, Noto Sans Arabic and Droid Sans Fallback — without them
+Chinese, Japanese and Arabic interface text would draw as empty boxes. A text style
 can use them by family name, and they draw characters a text's font lacks when no installed
 wide-coverage CJK font has them. Without `CRAFT_FONTS_DIR` nothing is embedded. SHX
 fonts (including big fonts such as `chineset.shx`) aren't read yet: text in an SHX style is drawn
@@ -357,6 +359,26 @@ RISC-V (riscv64): `cadcraft-<ver>-linux-riscv64.tar.gz`, cross-compiled; needs g
 | Build | File | Notes |
 |---|---|---|
 | Static site | `cadcraft-web-<ver>.zip` | Runs in a modern browser; host it on any static server |
+
+### Docker
+
+One image carries the browser build (served by nginx) and the headless `cadcraft-cli`, including the
+MCP server over stdio. Nothing is published to a registry; build it from the repository, with the
+web build made first:
+
+```sh
+CRAFT_FONTS_DIR=/path/to/craft-fonts packaging/web/package.sh  # writes dist/web/ (CJK text needs this)
+docker build -f packaging/docker/Dockerfile -t cadcraft .
+docker run --rm -p 8772:80 cadcraft                     # the web app → http://localhost:8772/
+docker run --rm -v "$PWD:/work" cadcraft info /work/plan.dxf
+docker run -i --rm cadcraft mcp                         # MCP server on stdio
+```
+
+The desktop app is deliberately not in the image: a container has no window, GPU, tray or native
+dialogs to give it. Building the image (including from a release web zip), the compose setup, and
+the full CLI and MCP examples are in [`packaging/docker/README.md`](packaging/docker/README.md).
+[`packaging/drawings-viewer/`](packaging/drawings-viewer/) is a small site that lists a folder of
+DWG/DXF and opens them in the web build — served by that image (`serve.sh`) or from GitLab Pages.
 
 ## The Crafting Apps
 

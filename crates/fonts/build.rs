@@ -3,9 +3,11 @@
 //! empty, `CRAFT_FONTS` is empty and the build is unchanged. It only reads the local checkout
 //! (no network). A bad checkout is a warning, or an error with `CRAFT_FONTS_REQUIRED=1`.
 //!
-//! On wasm32 it embeds only BIZ UDPGothic Regular and the `Arab` faces (about 5.5 MB), to keep the
-//! web build within hosting limits (Cloudflare Pages: 25 MiB per file). The web build has no
-//! system fonts, so these are its only fallback for Japanese and Arabic-script text.
+//! On wasm32 it embeds the faces an app has no other source for, because a browser has no system
+//! fonts: Japanese (BIZ UDPGothic Regular), Arabic script (the `Arab` faces) and Simplified
+//! Chinese (Droid Sans Fallback — the everyday CJK repertoire). Droid Sans Fallback is Apache-2.0;
+//! Noto Sans CJK, the other candidate, is Source Han Sans and stays barred (`BARRED_FAMILIES`,
+//! AGENTS.md). The web build has no system fonts, so these are its only fallback for CJK text.
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -55,7 +57,9 @@ fn craft_fonts(dir: &std::path::Path) -> Result<String, String> {
             continue;
         }
         let arabic = scripts.split(',').any(|s| s.trim() == "Arab");
-        let web_face = (*family == "BIZ UDPGothic" && *style == "Regular") || arabic;
+        // The face that draws Simplified Chinese in the browser (see the module comment).
+        let cjk = *family == "Droid Sans Fallback";
+        let web_face = (*family == "BIZ UDPGothic" && *style == "Regular") || arabic || cjk;
         if wasm && !web_face {
             continue;
         }
